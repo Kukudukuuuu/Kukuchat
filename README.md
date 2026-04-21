@@ -71,6 +71,16 @@ python main.py
 The app will verify the MongoDB connection before starting and exit immediately if it cannot connect or if the `.env` values are missing.
 
 ---
+## Environment variables
+
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `MONGO_URI` | Yes | — | MongoDB connection string |
+| `DB_NAME` | Yes | — | Database name |
+| `MSG_COLLECTION` | No | `messages` | Collection name for messages |
+| `PAGE_SIZE` | No | `50` | Max messages shown per view |
+
+---
 
 ## MongoDB Collections
 
@@ -143,17 +153,6 @@ On launch you are prompted to log in or register. After authenticating, the main
 
 **Login**
 - 3 attempts allowed before lockout for that session
-
----
-
-## Environment variables
-
-| Variable | Required | Default | Description |
-|---|---|---|---|
-| `MONGO_URI` | Yes | — | MongoDB connection string |
-| `DB_NAME` | Yes | — | Database name |
-| `MSG_COLLECTION` | No | `messages` | Collection name for messages |
-| `PAGE_SIZE` | No | `50` | Max messages shown per view |
 
 ---
 
