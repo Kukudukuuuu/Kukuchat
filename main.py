@@ -1,161 +1,208 @@
-from pymongo import MongoClient
-from datetime import datetime
-from termcolor import colored
+"""
+Kuku Chat — terminal messaging app
+Deps: pymongo bcrypt python-dotenv termcolor
+  pip install pymongo bcrypt python-dotenv termcolor
+"""
+
 import hashlib
 import getpass
+import os
 import re
+import sys
+from datetime import datetime
+
+import bcrypt
 from bson import ObjectId
+from dotenv import load_dotenv
+from pymongo import MongoClient
+from termcolor import colored
 
-# Connection to MongoDB
-cluster = MongoClient("")
-db_messages = cluster[""][""]
-db_users = cluster[""]["users"]
-db_groups = cluster[""]["groups"]
+load_dotenv()
 
-# Global variable to store current user
+# ── Config from .env ───────────────────────────────────────────────────────────
+MONGO_URI   = os.getenv("MONGO_URI", "")
+DB_NAME     = os.getenv("DB_NAME", "")
+MSG_COL     = os.getenv("MSG_COLLECTION", "messages")
+PAGE_SIZE   = int(os.getenv("PAGE_SIZE", 50))
+
+if not MONGO_URI or not DB_NAME:
+    print(colored("Error: MONGO_URI and DB_NAME must be set in your .env file.", 'red'))
+    sys.exit(1)
+
+try:
+    cluster     = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
+    cluster.server_info()   # fail fast if unreachable
+    db_messages = cluster[DB_NAME][MSG_COL]
+    db_users    = cluster[DB_NAME]["users"]
+    db_groups   = cluster[DB_NAME]["groups"]
+except Exception as e:
+    print(colored(f"Could not connect to MongoDB: {e}", 'red'))
+    sys.exit(1)
+
 current_user = None
 
-def hash_password(password):
-    """Hash a password using SHA-256"""
-    return hashlib.sha256(password.encode()).hexdigest()
+DATE_FMT = "%Y-%m-%d"
+TIME_FMT = "%H:%M:%S"
 
-def validate_username(username):
-    """Validate username format"""
-    if len(username) < 3:
-        return False, "Username must be at least 3 characters long"
-    if len(username) > 20:
-        return False, "Username must be no more than 20 characters long"
-    if not re.match("^[a-zA-Z0-9_]+$", username):
-        return False, "Username can only contain letters, numbers, and underscores"
-    return True, ""
 
-def validate_password(password):
-    """Validate password strength"""
-    if len(password) < 6:
-        return False, "Password must be at least 6 characters long"
-    if len(password) > 50:
-        return False, "Password must be no more than 50 characters long"
-    return True, ""
+# ── Auth helpers ───────────────────────────────────────────────────────────────
+def hash_password(password: str) -> str:
+    return bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
 
-def register_user():
-    """Register a new user"""
-    print(colored("\n=== USER REGISTRATION ===", 'blue', attrs=['bold']))
-    
-    while True:
-        username = input(colored("Enter username: ", 'green')).strip()
-        if not username:
-            print(colored("Username cannot be empty!", 'red'))
-            continue
-            
-        valid, message = validate_username(username)
-        if not valid:
-            print(colored(message, 'red'))
-            continue
-            
-        # Check if username already exists
-        if db_users.find_one({"username": username}):
-            print(colored("Username already exists! Please choose another.", 'red'))
-            continue
-            
-        break
-    
-    while True:
-        password = getpass.getpass(colored("Enter password: ", 'green'))
-        if not password:
-            print(colored("Password cannot be empty!", 'red'))
-            continue
-            
-        valid, message = validate_password(password)
-        if not valid:
-            print(colored(message, 'red'))
-            continue
-            
-        confirm_password = getpass.getpass(colored("Confirm password: ", 'green'))
-        if password != confirm_password:
-            print(colored("Passwords do not match!", 'red'))
-            continue
-            
-        break
-    
-    # Get additional user info
-    full_name = input(colored("Enter full name (optional): ", 'green')).strip()
-    
+
+def check_password(password: str, hashed: str) -> bool:
     try:
-        # Create user document
-        user_doc = {
-            "username": username,
-            "password": hash_password(password),
-            "full_name": full_name if full_name else username,
-            "created_at": datetime.now(),
-            "last_login": None
-        }
-        
-        result = db_users.insert_one(user_doc)
-        if result.inserted_id:
-            print(colored("Registration successful! You can now log in.", 'green'))
-            return True
-        else:
-            print(colored("Registration failed! Please try again.", 'red'))
-            return False
-            
-    except Exception as e:
-        print(colored(f"Error during registration: {e}", 'red'))
+        return bcrypt.checkpw(password.encode(), hashed.encode())
+    except Exception:
         return False
 
-def login_user():
-    """Login an existing user"""
-    global current_user
-    
-    print(colored("\n=== USER LOGIN ===", 'blue', attrs=['bold']))
-    
-    max_attempts = 3
-    attempts = 0
-    
-    while attempts < max_attempts:
+
+def validate_username(username: str) -> tuple[bool, str]:
+    if len(username) < 3:
+        return False, "Username must be at least 3 characters."
+    if len(username) > 20:
+        return False, "Username must be 20 characters or fewer."
+    if not re.match(r"^[a-zA-Z0-9_]+$", username):
+        return False, "Username can only contain letters, numbers, and underscores."
+    return True, ""
+
+
+def validate_password(password: str) -> tuple[bool, str]:
+    if len(password) < 6:
+        return False, "Password must be at least 6 characters."
+    if len(password) > 50:
+        return False, "Password must be 50 characters or fewer."
+    return True, ""
+
+
+# ── Display helpers ────────────────────────────────────────────────────────────
+def fmt_time(date_str: str, time_str: str) -> str:
+    today = datetime.now().strftime(DATE_FMT)
+    if date_str == today:
+        return f"Today {time_str}"
+    return f"{date_str} {time_str}"
+
+
+def print_message(message: dict, own_username: str):
+    sender    = message.get("id", "?")
+    date_disp = fmt_time(message.get("date", ""), message.get("time", ""))
+    msg_type  = message.get("message_type", "")
+
+    print(colored(date_disp, 'red'))
+
+    if msg_type == "dm":
+        recipient = message.get("recipient", "?")
+        direction = f"{sender} -> {recipient}"
+        print(colored("DM: ", 'magenta'), colored(direction, 'magenta', attrs=['bold']))
+    elif msg_type == "group":
+        print(colored("Group: ", 'magenta'),
+              colored(message.get("group_name", "?"), 'magenta', attrs=['bold']))
+    elif msg_type == "public":
+        print(colored("[ Public Chat ]", 'white', attrs=['bold']))
+
+    if sender == own_username:
+        print(colored("From: ", 'green'), colored(f"{sender} (You)", 'cyan', attrs=['bold']))
+    else:
+        print(colored("From: ", 'green'), colored(sender, 'cyan'))
+
+    print(colored("Message: ", 'green'), message["message"])
+    print(colored(f"  [ID: {message['_id']}]", 'dark_grey') if '_id' in message else "")
+    print("-" * 63)
+
+
+# ── Registration ───────────────────────────────────────────────────────────────
+def register_user():
+    print(colored("\n=== USER REGISTRATION ===", 'blue', attrs=['bold']))
+
+    while True:
         username = input(colored("Username: ", 'green')).strip()
         if not username:
-            print(colored("Username cannot be empty!", 'red'))
+            print(colored("Username cannot be empty.", 'red'))
             continue
-            
+        valid, msg = validate_username(username)
+        if not valid:
+            print(colored(msg, 'red'))
+            continue
+        if db_users.find_one({"username": username}):
+            print(colored("Username already taken.", 'red'))
+            continue
+        break
+
+    while True:
         password = getpass.getpass(colored("Password: ", 'green'))
         if not password:
-            print(colored("Password cannot be empty!", 'red'))
+            print(colored("Password cannot be empty.", 'red'))
             continue
-        
+        valid, msg = validate_password(password)
+        if not valid:
+            print(colored(msg, 'red'))
+            continue
+        confirm = getpass.getpass(colored("Confirm password: ", 'green'))
+        if password != confirm:
+            print(colored("Passwords do not match.", 'red'))
+            continue
+        break
+
+    full_name = input(colored("Full name (optional): ", 'green')).strip()
+
+    try:
+        result = db_users.insert_one({
+            "username":   username,
+            "password":   hash_password(password),
+            "full_name":  full_name or username,
+            "created_at": datetime.now(),
+            "last_login": None,
+        })
+        if result.inserted_id:
+            print(colored("Registration successful. You can now log in.", 'green'))
+            return True
+        print(colored("Registration failed.", 'red'))
+        return False
+    except Exception as e:
+        print(colored(f"Error: {e}", 'red'))
+        return False
+
+
+# ── Login / Logout ─────────────────────────────────────────────────────────────
+def login_user():
+    global current_user
+    print(colored("\n=== LOGIN ===", 'blue', attrs=['bold']))
+
+    for attempt in range(1, 4):
+        username = input(colored("Username: ", 'green')).strip()
+        if not username:
+            print(colored("Username cannot be empty.", 'red'))
+            continue
+
+        password = getpass.getpass(colored("Password: ", 'green'))
+        if not password:
+            print(colored("Password cannot be empty.", 'red'))
+            continue
+
         try:
-            # Find user in database
             user = db_users.find_one({"username": username})
-            
-            if user and user["password"] == hash_password(password):
-                # Update last login
-                db_users.update_one(
-                    {"username": username},
-                    {"$set": {"last_login": datetime.now()}}
-                )
-                
+            if user and check_password(password, user["password"]):
+                db_users.update_one({"username": username},
+                                    {"$set": {"last_login": datetime.now()}})
                 current_user = {
-                    "username": username,
-                    "full_name": user.get("full_name", username)
+                    "username":  username,
+                    "full_name": user.get("full_name", username),
                 }
-                
                 print(colored(f"Welcome back, {current_user['full_name']}!", 'green'))
                 return True
+
+            remaining = 3 - attempt
+            if remaining:
+                print(colored(f"Invalid credentials. {remaining} attempt(s) remaining.", 'red'))
             else:
-                attempts += 1
-                remaining = max_attempts - attempts
-                if remaining > 0:
-                    print(colored(f"Invalid credentials! {remaining} attempts remaining.", 'red'))
-                else:
-                    print(colored("Too many failed attempts! Please try again later.", 'red'))
-                    
+                print(colored("Too many failed attempts.", 'red'))
         except Exception as e:
             print(colored(f"Login error: {e}", 'red'))
-            attempts += 1
-    
+
     return False
 
+
 def logout_user():
-    """Logout current user"""
     global current_user
     if current_user:
         print(colored(f"Goodbye, {current_user['full_name']}!", 'yellow'))
@@ -163,590 +210,561 @@ def logout_user():
     else:
         print(colored("No user is currently logged in.", 'yellow'))
 
-# GROUP CHAT FUNCTIONS
 
-def create_group():
-    """Create a new group chat"""
+# ── Private DMs ────────────────────────────────────────────────────────────────
+def send_dm():
     if not current_user:
-        print(colored("Please log in to create groups.", 'red'))
+        print(colored("Please log in first.", 'red'))
         return
-    
-    print(colored("\n=== CREATE GROUP CHAT ===", 'blue', attrs=['bold']))
-    
-    # Get group name
+
+    recipient_name = input(colored("Send DM to (username): ", 'green')).strip()
+    if not recipient_name:
+        return
+    if recipient_name == current_user["username"]:
+        print(colored("You cannot DM yourself.", 'red'))
+        return
+    if not db_users.find_one({"username": recipient_name}):
+        print(colored(f"User '{recipient_name}' not found.", 'red'))
+        return
+
+    message = input(colored("Message: ", 'green')).strip()
+    if not message:
+        print(colored("Message cannot be empty.", 'red'))
+        return
+
+    now = datetime.now()
+    result = db_messages.insert_one({
+        "id":           current_user["username"],
+        "sender_name":  current_user["full_name"],
+        "recipient":    recipient_name,
+        "message":      message,
+        "message_type": "dm",
+        "date":         now.strftime(DATE_FMT),
+        "time":         now.strftime(TIME_FMT),
+        "timestamp":    now,
+    })
+    if result.inserted_id:
+        print(colored(f"DM sent to {recipient_name}.", 'green'))
+    else:
+        print(colored("Failed to send DM.", 'red'))
+
+
+def view_dms():
+    if not current_user:
+        print(colored("Please log in first.", 'red'))
+        return
+
+    me = current_user["username"]
+    messages = list(
+        db_messages.find({
+            "message_type": "dm",
+            "$or": [{"id": me}, {"recipient": me}],
+        })
+        .sort("timestamp", 1)
+        .limit(PAGE_SIZE)
+    )
+
+    print(colored(f"\n=== YOUR DIRECT MESSAGES (last {PAGE_SIZE}) ===", 'blue', attrs=['bold']))
+    if not messages:
+        print(colored("No direct messages yet.", 'yellow'))
+        return
+    for msg in messages:
+        print_message(msg, me)
+
+
+# ── Delete message ─────────────────────────────────────────────────────────────
+def delete_message():
+    if not current_user:
+        print(colored("Please log in first.", 'red'))
+        return
+
+    msg_id = input(colored("Message ID to delete: ", 'green')).strip()
+    try:
+        oid = ObjectId(msg_id)
+    except Exception:
+        print(colored("Invalid message ID.", 'red'))
+        return
+
+    msg = db_messages.find_one({"_id": oid})
+    if not msg:
+        print(colored("Message not found.", 'red'))
+        return
+    if msg.get("id") != current_user["username"]:
+        print(colored("You can only delete your own messages.", 'red'))
+        return
+
+    confirm = input(colored("Delete this message? (yes/no): ", 'yellow'))
+    if confirm.lower() != "yes":
+        return
+
+    db_messages.delete_one({"_id": oid})
+
+    # Decrement group counter if applicable
+    if msg.get("group_id"):
+        db_groups.update_one({"_id": msg["group_id"]}, {"$inc": {"message_count": -1}})
+
+    print(colored("Message deleted.", 'green'))
+
+
+# ── Search messages ────────────────────────────────────────────────────────────
+def search_messages():
+    if not current_user:
+        print(colored("Please log in first.", 'red'))
+        return
+
+    term = input(colored("Search term: ", 'green')).strip()
+    if not term:
+        return
+
+    me         = current_user["username"]
+    my_groups  = list(db_groups.find({"members": me}))
+    group_ids  = [g["_id"] for g in my_groups]
+
+    results = list(
+        db_messages.find({
+            "message": {"$regex": term, "$options": "i"},
+            "$or": [
+                {"id": me},
+                {"recipient": me},
+                {"group_id": {"$in": group_ids}},
+            ],
+        })
+        .sort("timestamp", -1)
+        .limit(PAGE_SIZE)
+    )
+
+    print(colored(f"\n=== SEARCH RESULTS for '{term}' ===", 'blue', attrs=['bold']))
+    if not results:
+        print(colored("No messages found.", 'yellow'))
+        return
+    for msg in reversed(results):
+        print_message(msg, me)
+
+
+# ── Group functions ────────────────────────────────────────────────────────────
+def create_group():
+    if not current_user:
+        print(colored("Please log in first.", 'red'))
+        return
+
+    print(colored("\n=== CREATE GROUP ===", 'blue', attrs=['bold']))
+
     while True:
-        group_name = input(colored("Enter group name: ", 'green')).strip()
-        if not group_name:
-            print(colored("Group name cannot be empty!", 'red'))
+        name = input(colored("Group name: ", 'green')).strip()
+        if not name:
+            print(colored("Name cannot be empty.", 'red'))
             continue
-        if len(group_name) > 50:
-            print(colored("Group name must be 50 characters or less!", 'red'))
+        if len(name) > 50:
+            print(colored("Name must be 50 characters or fewer.", 'red'))
             continue
-        
-        # Check if group name already exists
-        if db_groups.find_one({"name": group_name}):
-            print(colored("Group name already exists! Please choose another.", 'red'))
+        if db_groups.find_one({"name": name}):
+            print(colored("That name is already taken.", 'red'))
             continue
         break
-    
-    # Get group description
-    description = input(colored("Enter group description (optional): ", 'green')).strip()
-    
-    # Get group type
-    print(colored("\nGroup Types:", 'yellow'))
-    print("1. Public (anyone can join)")
-    print("2. Private (invite only)")
-    
+
+    description = input(colored("Description (optional): ", 'green')).strip()
+
+    print(colored("\n1. Public  2. Private", 'yellow'))
     while True:
-        group_type = input(colored("Select group type (1-2): ", 'cyan'))
-        if group_type == "1":
+        t = input(colored("Type (1/2): ", 'cyan'))
+        if t == "1":
             is_private = False
             break
-        elif group_type == "2":
+        if t == "2":
             is_private = True
             break
-        else:
-            print(colored("Invalid option! Please select 1 or 2.", 'red'))
-    
-    try:
-        # Create group document
-        group_doc = {
-            "name": group_name,
-            "description": description,
-            "created_by": current_user["username"],
-            "admins": [current_user["username"]],
-            "members": [current_user["username"]],
-            "is_private": is_private,
-            "created_at": datetime.now(),
-            "message_count": 0
-        }
-        
-        result = db_groups.insert_one(group_doc)
-        if result.inserted_id:
-            print(colored(f"Group '{group_name}' created successfully!", 'green'))
-            print(colored(f"Group ID: {result.inserted_id}", 'blue'))
-        else:
-            print(colored("Failed to create group!", 'red'))
-            
-    except Exception as e:
-        print(colored(f"Error creating group: {e}", 'red'))
+        print(colored("Enter 1 or 2.", 'red'))
+
+    result = db_groups.insert_one({
+        "name":          name,
+        "description":   description,
+        "created_by":    current_user["username"],
+        "admins":        [current_user["username"]],
+        "members":       [current_user["username"]],
+        "is_private":    is_private,
+        "created_at":    datetime.now(),
+        "message_count": 0,
+    })
+    if result.inserted_id:
+        print(colored(f"Group '{name}' created. ID: {result.inserted_id}", 'green'))
+    else:
+        print(colored("Failed to create group.", 'red'))
+
 
 def list_groups():
-    """List all available groups"""
     if not current_user:
-        print(colored("Please log in to view groups.", 'red'))
+        print(colored("Please log in first.", 'red'))
         return
-    
-    try:
-        # Get all groups user is member of
-        my_groups = list(db_groups.find({"members": current_user["username"]}))
-        
-        # Get public groups user is not member of
-        public_groups = list(db_groups.find({
-            "is_private": False,
-            "members": {"$ne": current_user["username"]}
-        }))
-        
-        print(colored("\n=== MY GROUPS ===", 'blue', attrs=['bold']))
-        if my_groups:
-            for group in my_groups:
-                status = "Admin" if current_user["username"] in group.get("admins", []) else "Member"
-                member_count = len(group.get("members", []))
-                print(colored(f"• {group['name']}", 'green', attrs=['bold']))
-                print(f"  Status: {colored(status, 'cyan')}")
-                print(f"  Members: {member_count}")
-                print(f"  Messages: {group.get('message_count', 0)}")
-                if group.get("description"):
-                    print(f"  Description: {group['description']}")
-                print(f"  ID: {colored(str(group['_id']), 'blue')}")
-                print()
-        else:
-            print(colored("You are not a member of any groups.", 'yellow'))
-        
-        print(colored("=== PUBLIC GROUPS (Available to Join) ===", 'blue', attrs=['bold']))
-        if public_groups:
-            for group in public_groups:
-                member_count = len(group.get("members", []))
-                print(colored(f"• {group['name']}", 'magenta', attrs=['bold']))
-                print(f"  Members: {member_count}")
-                print(f"  Messages: {group.get('message_count', 0)}")
-                if group.get("description"):
-                    print(f"  Description: {group['description']}")
-                print(f"  ID: {colored(str(group['_id']), 'blue')}")
-                print()
-        else:
-            print(colored("No public groups available to join.", 'yellow'))
-            
-    except Exception as e:
-        print(colored(f"Error listing groups: {e}", 'red'))
+
+    me          = current_user["username"]
+    my_groups   = list(db_groups.find({"members": me}))
+    avail       = list(db_groups.find({"is_private": False, "members": {"$ne": me}}))
+
+    print(colored("\n=== MY GROUPS ===", 'blue', attrs=['bold']))
+    if my_groups:
+        for g in my_groups:
+            role = "Admin" if me in g.get("admins", []) else "Member"
+            print(colored(f"  {g['name']}", 'green', attrs=['bold']),
+                  colored(f"[{role}]", 'cyan'),
+                  f"{len(g.get('members', []))} members  |  {g.get('message_count', 0)} msgs")
+            if g.get("description"):
+                print(f"    {g['description']}")
+            print(f"    ID: {colored(str(g['_id']), 'blue')}")
+    else:
+        print(colored("You are not in any groups.", 'yellow'))
+
+    print(colored("\n=== AVAILABLE PUBLIC GROUPS ===", 'blue', attrs=['bold']))
+    if avail:
+        for g in avail:
+            print(colored(f"  {g['name']}", 'magenta', attrs=['bold']),
+                  f"{len(g.get('members', []))} members  |  {g.get('message_count', 0)} msgs")
+            if g.get("description"):
+                print(f"    {g['description']}")
+            print(f"    ID: {colored(str(g['_id']), 'blue')}")
+    else:
+        print(colored("No public groups available.", 'yellow'))
+
+
+def _pick_my_group(prompt="Select group: ") -> dict | None:
+    """Helper — show numbered list of user's groups, return chosen one."""
+    me     = current_user["username"]
+    groups = list(db_groups.find({"members": me}))
+    if not groups:
+        print(colored("You are not in any groups.", 'yellow'))
+        return None
+    for i, g in enumerate(groups, 1):
+        print(f"{i}. {colored(g['name'], 'cyan')} ({len(g.get('members', []))} members)")
+    while True:
+        choice = input(colored(prompt, 'yellow'))
+        if choice.lower() == "cancel":
+            return None
+        try:
+            idx = int(choice) - 1
+            if 0 <= idx < len(groups):
+                return groups[idx]
+            print(colored("Invalid selection.", 'red'))
+        except ValueError:
+            print(colored("Enter a number or 'cancel'.", 'red'))
+
 
 def join_group():
-    """Join a group chat"""
     if not current_user:
-        print(colored("Please log in to join groups.", 'red'))
+        print(colored("Please log in first.", 'red'))
         return
-    
+
+    me     = current_user["username"]
+    avail  = list(db_groups.find({"is_private": False, "members": {"$ne": me}}))
+    if not avail:
+        print(colored("No public groups to join.", 'yellow'))
+        return
+
     print(colored("\n=== JOIN GROUP ===", 'blue', attrs=['bold']))
-    
-    # Show available public groups
-    try:
-        public_groups = list(db_groups.find({
-            "is_private": False,
-            "members": {"$ne": current_user["username"]}
-        }))
-        
-        if not public_groups:
-            print(colored("No public groups available to join.", 'yellow'))
+    for i, g in enumerate(avail, 1):
+        print(f"{i}. {colored(g['name'], 'cyan')} ({len(g.get('members', []))} members)")
+        if g.get("description"):
+            print(f"   {g['description']}")
+
+    while True:
+        choice = input(colored("Select number (or 'cancel'): ", 'yellow'))
+        if choice.lower() == "cancel":
             return
-        
-        print(colored("Available Groups:", 'green'))
-        for i, group in enumerate(public_groups, 1):
-            member_count = len(group.get("members", []))
-            print(f"{i}. {colored(group['name'], 'cyan')} ({member_count} members)")
-            if group.get("description"):
-                print(f"   {group['description']}")
-        
-        while True:
-            try:
-                choice = input(colored("\nSelect group number (or 'cancel' to exit): ", 'yellow'))
-                if choice.lower() == 'cancel':
-                    return
-                
-                choice = int(choice) - 1
-                if 0 <= choice < len(public_groups):
-                    selected_group = public_groups[choice]
-                    break
-                else:
-                    print(colored("Invalid selection!", 'red'))
-            except ValueError:
-                print(colored("Please enter a valid number!", 'red'))
-        
-        # Add user to group
-        result = db_groups.update_one(
-            {"_id": selected_group["_id"]},
-            {"$push": {"members": current_user["username"]}}
-        )
-        
-        if result.modified_count > 0:
-            print(colored(f"Successfully joined group '{selected_group['name']}'!", 'green'))
-        else:
-            print(colored("Failed to join group!", 'red'))
-            
-    except Exception as e:
-        print(colored(f"Error joining group: {e}", 'red'))
+        try:
+            idx = int(choice) - 1
+            if 0 <= idx < len(avail):
+                g = avail[idx]
+                break
+            print(colored("Invalid selection.", 'red'))
+        except ValueError:
+            print(colored("Enter a number.", 'red'))
+
+    result = db_groups.update_one({"_id": g["_id"]}, {"$push": {"members": me}})
+    if result.modified_count:
+        print(colored(f"Joined '{g['name']}'.", 'green'))
+    else:
+        print(colored("Failed to join.", 'red'))
+
 
 def leave_group():
-    """Leave a group chat"""
     if not current_user:
-        print(colored("Please log in to leave groups.", 'red'))
+        print(colored("Please log in first.", 'red'))
         return
-    
+
     print(colored("\n=== LEAVE GROUP ===", 'blue', attrs=['bold']))
-    
-    try:
-        # Get user's groups
-        my_groups = list(db_groups.find({"members": current_user["username"]}))
-        
-        if not my_groups:
-            print(colored("You are not a member of any groups.", 'yellow'))
+    g = _pick_my_group("Select group to leave (or 'cancel'): ")
+    if not g:
+        return
+
+    me     = current_user["username"]
+    admins = g.get("admins", [])
+
+    if me in admins and len(admins) == 1 and len(g.get("members", [])) > 1:
+        print(colored("You are the only admin. Promote someone else before leaving.", 'red'))
+        return
+
+    confirm = input(colored(f"Leave '{g['name']}'? (yes/no): ", 'yellow'))
+    if confirm.lower() != "yes":
+        return
+
+    db_groups.update_one({"_id": g["_id"]},
+                          {"$pull": {"members": me, "admins": me}})
+    print(colored(f"Left '{g['name']}'.", 'green'))
+
+    updated = db_groups.find_one({"_id": g["_id"]})
+    if updated and not updated.get("members"):
+        db_groups.delete_one({"_id": g["_id"]})
+        print(colored("Group had no members left and was deleted.", 'yellow'))
+
+
+def promote_to_admin():
+    """Promote a group member to admin."""
+    if not current_user:
+        print(colored("Please log in first.", 'red'))
+        return
+
+    print(colored("\n=== PROMOTE TO ADMIN ===", 'blue', attrs=['bold']))
+    me = current_user["username"]
+
+    # Only show groups where current user is admin
+    admin_groups = list(db_groups.find({"admins": me}))
+    if not admin_groups:
+        print(colored("You are not an admin of any group.", 'yellow'))
+        return
+
+    for i, g in enumerate(admin_groups, 1):
+        print(f"{i}. {colored(g['name'], 'cyan')}")
+
+    while True:
+        choice = input(colored("Select group (or 'cancel'): ", 'yellow'))
+        if choice.lower() == "cancel":
             return
-        
-        print(colored("Your Groups:", 'green'))
-        for i, group in enumerate(my_groups, 1):
-            status = "Admin" if current_user["username"] in group.get("admins", []) else "Member"
-            print(f"{i}. {colored(group['name'], 'cyan')} ({status})")
-        
-        while True:
-            try:
-                choice = input(colored("\nSelect group number to leave (or 'cancel' to exit): ", 'yellow'))
-                if choice.lower() == 'cancel':
-                    return
-                
-                choice = int(choice) - 1
-                if 0 <= choice < len(my_groups):
-                    selected_group = my_groups[choice]
-                    break
-                else:
-                    print(colored("Invalid selection!", 'red'))
-            except ValueError:
-                print(colored("Please enter a valid number!", 'red'))
-        
-        # Check if user is the only admin
-        admins = selected_group.get("admins", [])
-        if (current_user["username"] in admins and len(admins) == 1 and 
-            len(selected_group.get("members", [])) > 1):
-            print(colored("You are the only admin. Please promote another member to admin before leaving.", 'red'))
+        try:
+            idx = int(choice) - 1
+            if 0 <= idx < len(admin_groups):
+                g = admin_groups[idx]
+                break
+            print(colored("Invalid selection.", 'red'))
+        except ValueError:
+            print(colored("Enter a number.", 'red'))
+
+    members     = g.get("members", [])
+    non_admins  = [m for m in members if m not in g.get("admins", [])]
+    if not non_admins:
+        print(colored("All members are already admins.", 'yellow'))
+        return
+
+    print(colored("Members eligible for promotion:", 'green'))
+    for i, m in enumerate(non_admins, 1):
+        print(f"{i}. {m}")
+
+    while True:
+        choice = input(colored("Select member to promote (or 'cancel'): ", 'yellow'))
+        if choice.lower() == "cancel":
             return
-        
-        # Confirm leaving
-        confirm = input(colored(f"Are you sure you want to leave '{selected_group['name']}'? (yes/no): ", 'yellow'))
-        if confirm.lower() != 'yes':
-            return
-        
-        # Remove user from group
-        update_query = {
-            "$pull": {
-                "members": current_user["username"],
-                "admins": current_user["username"]
-            }
-        }
-        
-        result = db_groups.update_one({"_id": selected_group["_id"]}, update_query)
-        
-        if result.modified_count > 0:
-            print(colored(f"Successfully left group '{selected_group['name']}'.", 'green'))
-            
-            # If no members left, delete the group
-            updated_group = db_groups.find_one({"_id": selected_group["_id"]})
-            if not updated_group.get("members"):
-                db_groups.delete_one({"_id": selected_group["_id"]})
-                print(colored("Group was empty and has been deleted.", 'yellow'))
-        else:
-            print(colored("Failed to leave group!", 'red'))
-            
-    except Exception as e:
-        print(colored(f"Error leaving group: {e}", 'red'))
+        try:
+            idx = int(choice) - 1
+            if 0 <= idx < len(non_admins):
+                target = non_admins[idx]
+                break
+            print(colored("Invalid selection.", 'red'))
+        except ValueError:
+            print(colored("Enter a number.", 'red'))
+
+    db_groups.update_one({"_id": g["_id"]}, {"$push": {"admins": target}})
+    print(colored(f"'{target}' is now an admin of '{g['name']}'.", 'green'))
+
 
 def send_group_message():
-    """Send a message to a group"""
     if not current_user:
-        print(colored("Please log in to send group messages.", 'red'))
+        print(colored("Please log in first.", 'red'))
         return
-    
-    try:
-        # Get user's groups
-        my_groups = list(db_groups.find({"members": current_user["username"]}))
-        
-        if not my_groups:
-            print(colored("You are not a member of any groups.", 'yellow'))
-            return
-        
-        print(colored("\n=== SEND GROUP MESSAGE ===", 'blue', attrs=['bold']))
-        print(colored("Your Groups:", 'green'))
-        
-        for i, group in enumerate(my_groups, 1):
-            member_count = len(group.get("members", []))
-            print(f"{i}. {colored(group['name'], 'cyan')} ({member_count} members)")
-        
-        while True:
-            try:
-                choice = input(colored("\nSelect group number (or 'cancel' to exit): ", 'yellow'))
-                if choice.lower() == 'cancel':
-                    return
-                
-                choice = int(choice) - 1
-                if 0 <= choice < len(my_groups):
-                    selected_group = my_groups[choice]
-                    break
-                else:
-                    print(colored("Invalid selection!", 'red'))
-            except ValueError:
-                print(colored("Please enter a valid number!", 'red'))
-        
-        # Get message
-        message = input(colored(f"Message for '{selected_group['name']}': ", 'green'))
-        if not message.strip():
-            print(colored("Message cannot be empty!", 'red'))
-            return
-        
-        # Create message document
-        current_time = datetime.now()
-        msg = {
-            "id": current_user["username"],
-            "sender_name": current_user["full_name"],
-            "message": message.strip(),
-            "group_id": selected_group["_id"],
-            "group_name": selected_group["name"],
-            "message_type": "group",
-            "date": current_time.strftime("%x"),
-            "time": current_time.strftime("%X"),
-            "timestamp": current_time
-        }
-        
-        # Insert message
-        result = db_messages.insert_one(msg)
-        if result.inserted_id:
-            # Update group message count
-            db_groups.update_one(
-                {"_id": selected_group["_id"]},
-                {"$inc": {"message_count": 1}}
-            )
-            print(colored("Group message sent successfully!", 'green'))
-        else:
-            print(colored("Failed to send message!", 'red'))
-            
-    except Exception as e:
-        print(colored(f"Error sending group message: {e}", 'red'))
+
+    print(colored("\n=== SEND GROUP MESSAGE ===", 'blue', attrs=['bold']))
+    g = _pick_my_group("Select group (or 'cancel'): ")
+    if not g:
+        return
+
+    message = input(colored(f"Message for '{g['name']}': ", 'green')).strip()
+    if not message:
+        print(colored("Message cannot be empty.", 'red'))
+        return
+
+    now    = datetime.now()
+    result = db_messages.insert_one({
+        "id":           current_user["username"],
+        "sender_name":  current_user["full_name"],
+        "message":      message,
+        "group_id":     g["_id"],
+        "group_name":   g["name"],
+        "message_type": "group",
+        "date":         now.strftime(DATE_FMT),
+        "time":         now.strftime(TIME_FMT),
+        "timestamp":    now,
+    })
+    if result.inserted_id:
+        db_groups.update_one({"_id": g["_id"]}, {"$inc": {"message_count": 1}})
+        print(colored("Message sent.", 'green'))
+    else:
+        print(colored("Failed to send message.", 'red'))
+
 
 def view_group_messages():
-    """View messages from a specific group"""
     if not current_user:
-        print(colored("Please log in to view group messages.", 'red'))
+        print(colored("Please log in first.", 'red'))
         return
-    
-    try:
-        # Get user's groups
-        my_groups = list(db_groups.find({"members": current_user["username"]}))
-        
-        if not my_groups:
-            print(colored("You are not a member of any groups.", 'yellow'))
-            return
-        
-        print(colored("\n=== VIEW GROUP MESSAGES ===", 'blue', attrs=['bold']))
-        print(colored("Your Groups:", 'green'))
-        
-        for i, group in enumerate(my_groups, 1):
-            member_count = len(group.get("members", []))
-            message_count = group.get("message_count", 0)
-            print(f"{i}. {colored(group['name'], 'cyan')} ({member_count} members, {message_count} messages)")
-        
-        while True:
-            try:
-                choice = input(colored("\nSelect group number (or 'cancel' to exit): ", 'yellow'))
-                if choice.lower() == 'cancel':
-                    return
-                
-                choice = int(choice) - 1
-                if 0 <= choice < len(my_groups):
-                    selected_group = my_groups[choice]
-                    break
-                else:
-                    print(colored("Invalid selection!", 'red'))
-            except ValueError:
-                print(colored("Please enter a valid number!", 'red'))
-        
-        # Get group messages
-        group_messages = db_messages.find({
-            "group_id": selected_group["_id"]
-        }).sort([("timestamp", 1)])
-        
-        print(colored(f"\n=== {selected_group['name'].upper()} MESSAGES ===", 'blue', attrs=['bold']))
-        
-        message_count = 0
-        today = datetime.now().strftime("%x")
-        
-        for message in group_messages:
-            try:
-                msg_date = message["date"]
-                msg_time = message["time"]
-                sender = message["id"]
-                
-                if today == msg_date:
-                    date_display = f"Today - {msg_time}"
-                else:
-                    date_display = f"{msg_date} - {msg_time}"
-                
-                print(colored(date_display, 'red'))
-                
-                # Highlight current user's messages
-                if sender == current_user["username"]:
-                    print(colored("From: ", 'green'), colored(f"{sender} (You)", 'cyan', attrs=['bold']))
-                else:
-                    print(colored("From: ", 'green'), colored(sender, 'cyan'))
-                    
-                print(colored("Message: ", 'green'), message["message"])
-                print("---------------------------------------------------------------")
-                message_count += 1
-                
-            except KeyError:
-                continue
-        
-        if message_count == 0:
-            print(colored(f"No messages in '{selected_group['name']}' yet. Be the first to send one!", 'yellow'))
-            
-    except Exception as e:
-        print(colored(f"Error viewing group messages: {e}", 'red'))
 
-def display_messages():
-    """Display all messages (both private and group)"""
-    if not current_user:
-        print(colored("Please log in to view messages.", 'red'))
+    print(colored("\n=== VIEW GROUP MESSAGES ===", 'blue', attrs=['bold']))
+    g = _pick_my_group("Select group (or 'cancel'): ")
+    if not g:
         return
-        
-    try:
-        # Get all messages (private and group messages user has access to)
-        user_groups = list(db_groups.find({"members": current_user["username"]}))
-        group_ids = [group["_id"] for group in user_groups]
-        
-        # Find messages: either no group_id (private) or in user's groups
-        query = {
+
+    messages = list(
+        db_messages.find({"group_id": g["_id"]})
+        .sort("timestamp", 1)
+        .limit(PAGE_SIZE)
+    )
+
+    print(colored(f"\n=== {g['name'].upper()} (last {PAGE_SIZE}) ===", 'blue', attrs=['bold']))
+    if not messages:
+        print(colored("No messages yet.", 'yellow'))
+        return
+    for msg in messages:
+        print_message(msg, current_user["username"])
+
+
+# ── Public chat ────────────────────────────────────────────────────────────────
+def view_public_chat():
+    """Read the global public chat — visible to all logged-in users."""
+    if not current_user:
+        print(colored("Please log in first.", 'red'))
+        return
+
+    messages = list(
+        db_messages.find({"message_type": "public"})
+        .sort("timestamp", -1)
+        .limit(PAGE_SIZE)
+    )
+
+    print(colored(f"\n=== PUBLIC CHAT (last {PAGE_SIZE}) ===", 'blue', attrs=['bold']))
+    if not messages:
+        print(colored("No public messages yet. Be the first to post.", 'yellow'))
+        return
+    for msg in reversed(messages):
+        print_message(msg, current_user["username"])
+
+
+def send_public_message():
+    """Post a message to the global public chat."""
+    if not current_user:
+        print(colored("Please log in first.", 'red'))
+        return
+
+    message = input(colored("Public message: ", 'green')).strip()
+    if not message:
+        print(colored("Message cannot be empty.", 'red'))
+        return
+
+    now = datetime.now()
+    result = db_messages.insert_one({
+        "id":           current_user["username"],
+        "sender_name":  current_user["full_name"],
+        "message":      message,
+        "message_type": "public",
+        "date":         now.strftime(DATE_FMT),
+        "time":         now.strftime(TIME_FMT),
+        "timestamp":    now,
+    })
+    if result.inserted_id:
+        print(colored("Message posted to public chat.", 'green'))
+    else:
+        print(colored("Failed to post message.", 'red'))
+
+
+# ── All messages / my messages ─────────────────────────────────────────────────
+def display_all_messages():
+    if not current_user:
+        print(colored("Please log in first.", 'red'))
+        return
+
+    me        = current_user["username"]
+    group_ids = [g["_id"] for g in db_groups.find({"members": me})]
+
+    messages = list(
+        db_messages.find({
             "$or": [
-                {"group_id": {"$exists": False}},  # Private messages
-                {"group_id": {"$in": group_ids}}   # Group messages
+                {"id": me, "message_type": "dm"},
+                {"recipient": me, "message_type": "dm"},
+                {"group_id": {"$in": group_ids}},
+                {"message_type": "public"},
             ]
-        }
-        
-        all_messages = db_messages.find(query).sort([("timestamp", 1)])
-        today = datetime.now().strftime("%x")
-        
-        print(colored("=== ALL MESSAGES ===", 'blue', attrs=['bold']))
-        print()
-        
-        message_count = 0
-        for message in all_messages:
-            try:
-                if not all(key in message for key in ["date", "time", "id", "message"]):
-                    continue
-                
-                msg_date = message["date"]
-                msg_time = message["time"]
-                sender = message["id"]
-                
-                if today == msg_date:
-                    date_display = f"Today - {msg_time}"
-                else:
-                    date_display = f"{msg_date} - {msg_time}"
-                
-                print(colored(date_display, 'red'))
-                
-                # Show message type and sender
-                if "group_id" in message:
-                    group_name = message.get("group_name", "Unknown Group")
-                    print(colored("Group: ", 'magenta'), colored(group_name, 'magenta', attrs=['bold']))
-                
-                if sender == current_user["username"]:
-                    print(colored("From: ", 'green'), colored(f"{sender} (You)", 'cyan', attrs=['bold']))
-                else:
-                    print(colored("From: ", 'green'), colored(sender, 'cyan'))
-                    
-                print(colored("Message: ", 'green'), message["message"])
-                print("---------------------------------------------------------------")
-                message_count += 1
-                
-            except KeyError as e:
-                continue
-        
-        if message_count == 0:
-            print(colored("No messages found. Start a conversation!", 'yellow'))
-                
-    except Exception as e:
-        print(colored(f"Error retrieving messages: {e}", 'red'))
+        })
+        .sort("timestamp", 1)
+        .limit(PAGE_SIZE)
+    )
 
-def add_message():
-    """Add a new private message to the database"""
-    if not current_user:
-        print(colored("Please log in to send messages.", 'red'))
+    print(colored(f"\n=== ALL YOUR MESSAGES (last {PAGE_SIZE}) ===", 'blue', attrs=['bold']))
+    if not messages:
+        print(colored("No messages.", 'yellow'))
         return
-        
-    try:
-        message = input(colored("Private Message: ", 'green'))
-        if not message.strip():
-            print(colored("Message cannot be empty!", 'red'))
-            return
-        
-        # Create message document (private message - no group_id)
-        current_time = datetime.now()
-        msg = {
-            "id": current_user["username"],
-            "sender_name": current_user["full_name"],
-            "message": message.strip(),
-            "message_type": "private",
-            "date": current_time.strftime("%x"),
-            "time": current_time.strftime("%X"),
-            "timestamp": current_time
-        }
-        
-        # Insert message
-        result = db_messages.insert_one(msg)
-        if result.inserted_id:
-            print(colored("Private message sent successfully!", 'green'))
-        else:
-            print(colored("Failed to send message!", 'red'))
-            
-    except Exception as e:
-        print(colored(f"Error adding message: {e}", 'red'))
+    for msg in messages:
+        print_message(msg, me)
+
 
 def view_my_messages():
-    """View only current user's messages"""
     if not current_user:
-        print(colored("Please log in to view your messages.", 'red'))
+        print(colored("Please log in first.", 'red'))
         return
-        
-    try:
-        my_messages = db_messages.find({"id": current_user["username"]}).sort([("timestamp", 1)])
-        today = datetime.now().strftime("%x")
-        
-        print(colored(f"=== YOUR MESSAGES ===", 'blue', attrs=['bold']))
-        print()
-        
-        message_count = 0
-        for message in my_messages:
-            try:
-                msg_date = message["date"]
-                msg_time = message["time"]
-                
-                if today == msg_date:
-                    date_display = f"Today - {msg_time}"
-                else:
-                    date_display = f"{msg_date} - {msg_time}"
-                
-                print(colored(date_display, 'red'))
-                
-                # Show if it's a group message
-                if "group_id" in message:
-                    group_name = message.get("group_name", "Unknown Group")
-                    print(colored("Group: ", 'magenta'), colored(group_name, 'magenta', attrs=['bold']))
-                else:
-                    print(colored("Type: ", 'blue'), colored("Private", 'blue'))
-                
-                print(colored("Message: ", 'green'), message["message"])
-                print("---------------------------------------------------------------")
-                message_count += 1
-                
-            except KeyError:
-                continue
-        
-        if message_count == 0:
-            print(colored("You haven't sent any messages yet.", 'yellow'))
-            
-    except Exception as e:
-        print(colored(f"Error retrieving your messages: {e}", 'red'))
 
+    me       = current_user["username"]
+    messages = list(
+        db_messages.find({"id": me})
+        .sort("timestamp", 1)
+        .limit(PAGE_SIZE)
+    )
+
+    print(colored(f"\n=== YOUR SENT MESSAGES (last {PAGE_SIZE}) ===", 'blue', attrs=['bold']))
+    if not messages:
+        print(colored("You have not sent any messages.", 'yellow'))
+        return
+    for msg in messages:
+        print_message(msg, me)
+
+
+# ── Menus ──────────────────────────────────────────────────────────────────────
 def group_menu():
-    """Group management menu"""
     while True:
         print(colored("\n=== GROUP MANAGEMENT ===", 'blue', attrs=['bold']))
-        print(colored("Options:", 'yellow'))
-        print("1. Create new group")
+        print("1. Create group")
         print("2. List groups")
         print("3. Join group")
         print("4. Leave group")
-        print("5. Send group message")
-        print("6. View group messages")
-        print("7. Back to main menu")
-        
-        choice = input(colored("\nSelect option (1-7): ", 'cyan'))
-        
-        if choice == "1":
-            create_group()
-        elif choice == "2":
-            list_groups()
-        elif choice == "3":
-            join_group()
-        elif choice == "4":
-            leave_group()
-        elif choice == "5":
-            send_group_message()
-        elif choice == "6":
-            view_group_messages()
-        elif choice == "7":
+        print("5. Promote member to admin")
+        print("6. Send group message")
+        print("7. View group messages")
+        print("8. Back")
+
+        choice = input(colored("Select (1-8): ", 'cyan'))
+        actions = {
+            "1": create_group,
+            "2": list_groups,
+            "3": join_group,
+            "4": leave_group,
+            "5": promote_to_admin,
+            "6": send_group_message,
+            "7": view_group_messages,
+        }
+        if choice == "8":
             break
+        elif choice in actions:
+            actions[choice]()
         else:
-            print(colored("Invalid option! Please select 1-7.", 'red'))
+            print(colored("Invalid option.", 'red'))
+
 
 def auth_menu():
-    """Authentication menu for login/register"""
-    print(colored("🔐 Authentication Required", 'blue', attrs=['bold']))
-    print()
-    
+    print(colored("\nAuthentication Required", 'blue', attrs=['bold']))
     while True:
-        print(colored("Options:", 'yellow'))
-        print("1. Login")
-        print("2. Register")
-        print("3. Exit")
-        
-        choice = input(colored("\nSelect option (1-3): ", 'cyan'))
-        
+        print(colored("\n1. Login  2. Register  3. Exit", 'yellow'))
+        choice = input(colored("Select (1-3): ", 'cyan'))
         if choice == "1":
             if login_user():
                 return True
@@ -755,63 +773,66 @@ def auth_menu():
         elif choice == "3":
             return False
         else:
-            print(colored("Invalid option! Please select 1, 2, or 3.", 'red'))
+            print(colored("Invalid option.", 'red'))
+
 
 def main_menu():
-    """Main menu for authenticated users"""
-    print(colored(f"\n Kuku Chat", 'blue', attrs=['bold']))
-    print(colored(f"Logged in as: {current_user['full_name']}", 'green'))
-    
+    print(colored(f"\nKuku Chat  |  {current_user['full_name']}", 'blue', attrs=['bold']))
     while True:
-        print(colored("\nOptions:", 'yellow'))
-        print("1. View all messages")
-        print("2. View my messages")
-        print("3. Send private message")
-        print("4. Group chats")
-        print("5. Logout")
-        print("6. Exit")
-        
-        choice = input(colored("\nSelect option (1-6): ", 'cyan'))
-        
-        if choice == "1":
-            display_messages()
-        elif choice == "2":
-            view_my_messages()
-        elif choice == "3":
-            add_message()
-        elif choice == "4":
-            group_menu()
-        elif choice == "5":
-            logout_user()
-            return True  # Return to auth menu
-        elif choice == "6":
-            logout_user()
-            return False  # Exit application
-        else:
-            print(colored("Invalid option! Please select 1-6.", 'red'))
+        print(colored("\n1.  All messages", 'yellow'))
+        print("2.  My sent messages")
+        print("3.  Public chat")
+        print("4.  Post to public chat")
+        print("5.  Direct messages")
+        print("6.  Send DM")
+        print("7.  Group chats")
+        print("8.  Search messages")
+        print("9.  Delete a message")
+        print("10. Logout")
+        print("11. Exit")
 
+        choice = input(colored("Select (1-11): ", 'cyan'))
+        actions = {
+            "1":  display_all_messages,
+            "2":  view_my_messages,
+            "3":  view_public_chat,
+            "4":  send_public_message,
+            "5":  view_dms,
+            "6":  send_dm,
+            "7":  group_menu,
+            "8":  search_messages,
+            "9":  delete_message,
+        }
+        if choice == "10":
+            logout_user()
+            return True
+        elif choice == "11":
+            logout_user()
+            return False
+        elif choice in actions:
+            actions[choice]()
+        else:
+            print(colored("Invalid option.", 'red'))
+
+
+# ── Entry point ────────────────────────────────────────────────────────────────
 def main():
-    """Main function to run the messaging system"""
-    print(colored(" Kuku Messaging Group Chats", 'blue', attrs=['bold']))
-    print(colored("Private messages and group conversations for authenticated users", 'cyan'))
-    
+    print(colored("Kuku Chat", 'blue', attrs=['bold']))
+    print(colored("Terminal messaging with group chats and direct messages", 'cyan'))
     try:
         while True:
             if not current_user:
-                # Show authentication menu
                 if not auth_menu():
                     break
             else:
-                # Show main menu
                 if not main_menu():
                     break
-                    
-        print(colored("\nThank you for using  Kuku Chat! 👋", 'green'))
-        
+        print(colored("\nGoodbye.", 'green'))
     except KeyboardInterrupt:
-        print(colored("\n\nGoodbye! 👋", 'yellow'))
+        print(colored("\nInterrupted.", 'yellow'))
     except Exception as e:
-        print(colored(f"\nUnexpected error: {e}", 'red'))
+        print(colored(f"Unexpected error: {e}", 'red'))
+
 
 if __name__ == "__main__":
     main()
